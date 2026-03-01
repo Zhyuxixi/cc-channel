@@ -15,6 +15,7 @@ const __dirname = dirname(__filename);
 
 const isMacOS = platform() === "darwin";
 const isLinux = platform() === "linux";
+const isWindows = platform() === "win32";
 
 const LAUNCH_AGENT_NAME = "com.cc-channel";
 const SYSTEMD_SERVICE_NAME = "cc-channel";
@@ -33,6 +34,18 @@ function getSystemdServicePath(): string {
     mkdirSync(dir, { recursive: true });
   }
   return join(dir, `${SYSTEMD_SERVICE_NAME}.service`);
+}
+
+function getWindowsStartupBatPath(): string {
+  const dir = join(homedir(), ".cc-channel");
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  return join(dir, "cc-channel-daemon.bat");
+}
+
+function getWindowsLogPath(): string {
+  return join(homedir(), ".cc-channel", "logs");
 }
 
 function getNodePath(): string {
@@ -105,10 +118,32 @@ WantedBy=default.target
 `;
 }
 
+/**
+ * Generate Windows batch script to start daemon
+ */
+function generateWindowsStartupBat(): string {
+  const nodePath = getNodePath();
+  const daemonPath = getDaemonScriptPath();
+  const logDir = getWindowsLogPath();
+
+  // Ensure log directory exists
+  if (!existsSync(logDir)) {
+    mkdirSync(logDir, { recursive: true });
+  }
+
+  const logPath = join(logDir, "cc-channel.log");
+  const errorLogPath = join(logDir, "cc-channel-error.log");
+
+  return `@echo off
+cd /d "${homedir()}"
+start /b "" "${nodePath}" "${daemonPath}" > "${logPath}" 2> "${errorLogPath}"
+`;
+}
+
 export interface DaemonStatus {
   installed: boolean;
   running: boolean;
-  platform: "macos" | "linux" | "unsupported";
+  platform: "macos" | "linux" | "windows" | "unsupported";
 }
 
 /**
@@ -120,6 +155,9 @@ export function isDaemonInstalled(): boolean {
   }
   if (isLinux) {
     return existsSync(getSystemdServicePath());
+  }
+  if (isWindows) {
+    return existsSync(getWindowsStartupBatPath());
   }
   return false;
 }
@@ -152,9 +190,21 @@ export async function installDaemon(): Promise<{ success: boolean; message: stri
     };
   }
 
+  if (isWindows) {
+    const batPath = getWindowsStartupBatPath();
+    const batContent = generateWindowsStartupBat();
+
+    writeFileSync(batPath, batContent);
+
+    return {
+      success: true,
+      message: `Windows startup script installed at ${batPath}. You can run it manually or add to startup.`,
+    };
+  }
+
   return {
     success: false,
-    message: "Unsupported platform. Only macOS and Linux are supported.",
+    message: "Unsupported platform. Only macOS, Linux, and Windows are supported.",
   };
 }
 
@@ -195,6 +245,22 @@ export async function uninstallDaemon(): Promise<{ success: boolean; message: st
     return {
       success: true,
       message: "Systemd service uninstalled",
+    };
+  }
+
+  if (isWindows) {
+    const batPath = getWindowsStartupBatPath();
+
+    // Stop the daemon first
+    await stopDaemon();
+
+    if (existsSync(batPath)) {
+      unlinkSync(batPath);
+    }
+
+    return {
+      success: true,
+      message: "Windows startup script uninstalled",
     };
   }
 
@@ -266,6 +332,57 @@ export async function startDaemon(): Promise<{ success: boolean; message: string
       return {
         success: true,
         message: "Daemon started. Logs: /tmp/cc-channel.log",
+      };
+    } catch (err) {
+      return {
+        success: false,
+        message: `Failed to start: ${err}`,
+      };
+    }
+  }
+
+  if (isWindows) {
+    const { spawn } = await import("child_process");
+    const logDir = getWindowsLogPath();
+
+    // Ensure log directory exists
+    if (!existsSync(logDir)) {
+      mkdirSync(logDir, { recursive: true });
+    }
+
+    // Kill any existing process first
+    try {
+      const { execSync } = await import("child_process");
+      execSync('taskkill /F /IM node.exe /FI "WINDOWTITLE eq cc-channel*"', {
+        stdio: "ignore",
+      });
+    } catch {
+      // Ignore if no process to kill
+    }
+
+    // Start the daemon using PowerShell Start-Process for background execution
+    try {
+      const nodePath = getNodePath();
+      const daemonPath = getDaemonScriptPath();
+      const logPath = join(logDir, "cc-channel.log");
+      const errorLogPath = join(logDir, "cc-channel-error.log");
+
+      // Use PowerShell to start a detached process with proper escaping
+      const psArgs = [
+        "-NoProfile",
+        "-Command",
+        `Start-Process -FilePath '${nodePath}' -ArgumentList '${daemonPath}' -WindowStyle Hidden -RedirectStandardOutput '${logPath}' -RedirectStandardError '${errorLogPath}'`,
+      ];
+
+      spawn("powershell", psArgs, {
+        detached: true,
+        stdio: "ignore",
+        shell: false,
+      });
+
+      return {
+        success: true,
+        message: `Daemon started. Logs: ${logDir}\\cc-channel.log`,
       };
     } catch (err) {
       return {
@@ -359,6 +476,34 @@ export async function stopDaemon(): Promise<{ success: boolean; message: string 
     };
   }
 
+  if (isWindows) {
+    const { execSync } = await import("child_process");
+
+    // Kill node processes running cc-channel daemon
+    try {
+      // Find processes running daemon.js
+      execSync('taskkill /F /IM node.exe /FI "WINDOWTITLE eq cc-channel*"', {
+        stdio: "ignore",
+      });
+    } catch {
+      // Ignore if no process to kill
+    }
+
+    // Also try to kill by command line pattern
+    try {
+      execSync('wmic process where "name=\'node.exe\' and commandline like \'%cc-channel%daemon.js%\'" call terminate', {
+        stdio: "ignore",
+      });
+    } catch {
+      // Ignore errors
+    }
+
+    return {
+      success: true,
+      message: "Daemon stopped",
+    };
+  }
+
   return {
     success: false,
     message: "Unsupported platform",
@@ -369,9 +514,9 @@ export async function stopDaemon(): Promise<{ success: boolean; message: string 
  * Get daemon status
  */
 export async function getDaemonStatus(): Promise<DaemonStatus> {
-  const platformName = isMacOS ? "macos" : isLinux ? "linux" : "unsupported";
+  const platformName = isMacOS ? "macos" : isLinux ? "linux" : isWindows ? "windows" : "unsupported";
 
-  if (!isMacOS && !isLinux) {
+  if (!isMacOS && !isLinux && !isWindows) {
     return {
       installed: false,
       running: false,
@@ -404,6 +549,23 @@ export async function getDaemonStatus(): Promise<DaemonStatus> {
         stdio: ["pipe", "pipe", "ignore"],
       });
       running = result.trim() === "active";
+    } catch {
+      running = false;
+    }
+  }
+
+  if (isWindows && installed) {
+    try {
+      const { execSync } = await import("child_process");
+      // Use PowerShell to get running processes
+      const psCommand = "Get-Process node -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id";
+      const result = execSync(`powershell -Command "${psCommand}"`, {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      // If we have any node processes, check if daemon is running
+      // For simplicity, if there's any node process and our bat file exists, consider it running
+      running = result.toString().trim().length > 0;
     } catch {
       running = false;
     }
