@@ -30,6 +30,9 @@ export async function executeClaude(
     const cleanEnv = { ...process.env };
     delete cleanEnv.CLAUDECODE;
 
+    // On Windows, need shell: true to execute .cmd files from npm global packages
+    const isWindows = process.platform === "win32";
+
     const child: ChildProcess = spawn("claude", ["--print", prompt], {
       cwd: options.workDir,
       env: {
@@ -39,6 +42,7 @@ export async function executeClaude(
         TERM: "dumb",
       },
       stdio: ["ignore", "pipe", "pipe"],
+      shell: isWindows,
     });
 
     // Set timeout
@@ -124,10 +128,14 @@ export async function checkClaudeAvailable(): Promise<boolean> {
   const cleanEnv = { ...process.env };
   delete cleanEnv.CLAUDECODE;
 
+  // On Windows, need shell: true to execute .cmd files from npm global packages
+  const isWindows = process.platform === "win32";
+
   return new Promise((resolve) => {
     const child = spawn("claude", ["--version"], {
       env: cleanEnv,
       stdio: "ignore",
+      shell: isWindows,
     });
 
     child.on("close", (code) => {
